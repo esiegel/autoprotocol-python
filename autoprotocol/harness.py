@@ -270,37 +270,46 @@ def convert_param(protocol, val, typeDesc):
 class ProtocolInfo(object):
 
     def __init__(self, json):
-        self.input_types = json['inputs']
+        self.input_types  = json.get('inputs', {})
+        self.output_types = json.get('outputs', {})
 
-    def parse(self, protocol, inputs):
-        refs = inputs['refs']
-        params = inputs['parameters']
+    def _add_refs_to_protocol(self, protocol, user_inputs):
+        """Adds the refs found in the user_inputs to the protocol's refs"""
+        user_refs = user_inputs['refs']
 
-        for name in refs:
-            ref = refs[name]
-            c = protocol.ref(
-                name,
-                ref.get('id'),
-                ref['type'],
-                storage=ref.get('store'),
-                discard=ref.get('discard'),
-                cover=ref.get('cover'))
-            aqs = ref.get('aliquots')
-            if aqs:
-                for idx in aqs:
-                    aq = aqs[idx]
-                    c.well(idx).set_volume(aq['volume'])
-                    if "name" in aq:
-                        c.well(idx).set_name(aq['name'])
-                    if "properties" in aq:
-                        c.well(idx).set_properties(aq.get('properties'))
+        for name in user_refs:
+            user_ref      = user_refs[name]
+            user_aliquots = user_ref.get('aliquots', {})
 
-        out_params = {}
+            protocol_ref = protocol.ref(name,
+                                        user_ref.get('id'),
+                                        user_ref['type'],
+                                        storage=user_ref.get('store'),
+                                        discard=user_ref.get('discard'),
+                                        cover=user_ref.get('cover'))
+
+            for well_index, aliquot in user_aliquots.items():
+                protocol_ref.well(well_index).set_volume(aliquot['volume'])
+
+                if "name" in aliquot:
+                    protocol_ref.well(well_index).set_name(aliquot['name'])
+
+                if "properties" in aliquot:
+                    protocol_ref.well(well_index).set_properties(aliquot.get('properties'))
+
+    def _transform_user_inputs(self, protocol, user_inputs):
+        params = user_inputs['parameters']
+
+        transformed_params = {}
         for k in self.input_types:
             typeDesc = self.input_types[k]
-            out_params[k] = convert_param(protocol, params.get(k), typeDesc)
+            transformed_params[k] = convert_param(protocol, params.get(k), typeDesc)
 
-        return out_params
+        return transformed_params
+
+    def parse(self, protocol, user_inputs):
+        self._add_refs_to_protocol(protocol, user_inputs)
+        return self._transform_user_inputs(protocol, user_inputs)
 
 
 class Manifest(object):
@@ -343,13 +352,13 @@ class Manifest(object):
     def protocol_info(self, name):
         '''
         '''
-        try:
-            return ProtocolInfo(
-                next(p for p in self.protocols if p['name'] == name))
-        except StopIteration:
-            raise RuntimeError("Harness.run(): %s does not match "
-                               "the 'name' field of any protocol in the "
-                               "associated manifest.json file." % name)
+        for protocol in self.protocols:
+            if protocol['name'] == name:
+                return ProtocolInfo(protocol)
+
+        raise RuntimeError("Harness.run(): {} does not match "
+                           "the 'name' field of any protocol in the "
+                           "associated manifest.json file.".format(name))
 
 
 def run(fn, protocol_name=None, seal_after_run=True):
@@ -372,17 +381,17 @@ def run(fn, protocol_name=None, seal_after_run=True):
         using seal_on_store()
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        'config',
-        help='JSON-formatted protocol configuration file')
+    parser.add_argument('config', help='JSON-formatted protocol configuration file')
     args = parser.parse_args()
 
     source = json.loads(io.open(args.config, encoding='utf-8').read())
     protocol = Protocol()
+
     if protocol_name:
         manifest_json = io.open('manifest.json', encoding='utf-8').read()
-        manifest = Manifest(json.loads(manifest_json))
-        params = manifest.protocol_info(protocol_name).parse(protocol, source)
+        manifest      = Manifest(json.loads(manifest_json))
+        protocol_info = manifest.protocol_info(protocol_name)
+        params        = protocol_info.parse(protocol, source)
     else:
         params = protocol._ref_containers_and_wells(source["parameters"])
 
@@ -402,6 +411,80 @@ def run(fn, protocol_name=None, seal_after_run=True):
         return
 
     print(json.dumps(protocol.as_dict(), indent=2))
+
+
+def run_with_outputs(protocol_name, autoprotocol_fn, output_binding_fn):
+    """
+    Generate both the autoprotocol and the output binding given a protocol name
+    and handler function.  Fetches
+
+    Parameters
+    ----------
+    protocol_name: string
+        Name of protocol that must also exist in the manifest.
+
+    autoprotocol_fn : function
+        Function that generates Autoprotocol by manipulating the passed in protocol object.
+
+        It should be in the form:
+            def fn(protocol, protocol_user_inputs):
+                pass
+
+    output_binding_fn : function
+        Function that returns a dict of outputs that matches the output manifest.
+
+        It should be in the form:
+            def fn(protocol, output_manifest):
+                return {
+                    "my_important_container":   "some_ref_name",
+                    "my_important_aliquot":     "some_ref_name/10"
+                    "my_important_temperature": "42:celsius"
+                }
+
+    """
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('user_inputs', help='JSON-formatted user-inputs configuration file')
+    args = parser.parse_args()
+
+    # The protocol which will be built up via autoprotocol_fn
+    protocol = Protocol()
+
+    # load user_inputs and manifest.json
+    user_inputs   = json.loads(open(args.user_inputs, 'r').read().decode("utf-8"))
+    manifest_json = json.loads(open('manifest.json', 'r').read().decode('utf-8'))
+
+    # find protocol in the manifest by name.
+    protocol_info = Manifest(manifest_json).protocol_info(protocol_name)
+
+    # merge user input with the manifest's defaults.
+    user_inputs_with_defaults = protocol_info.parse(protocol, user_inputs)
+
+    try:
+        # generate autoprotocol by manipulating the protocol object passed in.
+        autoprotocol_fn(protocol,
+                        user_inputs_with_defaults,
+                        protocol_info.input_types,
+                        protocol_info.output_types)
+
+        # generate output_bindings by using the modified protocol and related info.
+        output_bindings = autoprotocol_fn(protocol,
+                                          user_inputs_with_defaults,
+                                          protocol_info.input_types,
+                                          protocol_info.output_types)
+
+        data = {
+            "autoprotocol": protocol.as_dict(),
+            "output_bindings": output_bindings
+        }
+
+        print(json.dumps(data, indent=2))
+    except UserError as e:
+        data = {
+            'errors': [{'message': e.message, 'info': e.info}]
+        }
+
+        print(json.dumps(data, indent=2))
 
 
 def _thermocycle_error_text():
