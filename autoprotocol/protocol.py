@@ -119,6 +119,7 @@ class Protocol(object):
         super(Protocol, self).__init__()
         self.refs = refs or {}
         self.instructions = instructions or []
+        self.outputs = {}
 
     def container_type(self, shortname):
         """
@@ -463,6 +464,28 @@ class Protocol(object):
             self.add_time_constraint(
                 to_dict, from_dict, time_between, mirror=False)
 
+    def output(self, name, value):
+        """Set the output value for a given name.
+
+        The name and type should match what are specified in the output manifest of
+        the protocol.
+
+        For example if in the output manifest it is specified as:
+
+          {
+              "plasmid_container": "container",
+              "important_aliquot": "aliquot",
+              "title": "string",
+          }
+
+        We would satisfy these outputs by calling:
+
+          protocol.output('plasmid_container', 'refname_of_container')
+          protocol.output('important_aliquot', {'refname': 'refname_of_container', wellIndex: 0})
+          protocol.output('title', 'super awesome title')
+        """
+        self.outputs[name] = value
+
     def get_instruction_index(self):
         """Get index of the last appended instruction
 
@@ -617,8 +640,11 @@ class Protocol(object):
 
         explicit_props = ["outs", "refs", "instructions", "time_constraints"]
 
-        return {attr: self._refify(getattr(self, attr)) for attr in prop_list
-            if attr in explicit_props}
+        autoprotocol = {attr: self._refify(getattr(self, attr)) for attr in prop_list
+                        if attr in explicit_props}
+
+        return { "autoprotocol": autoprotocol, "outputs": self.outputs }
+
 
     def store(self, container, condition):
         """
